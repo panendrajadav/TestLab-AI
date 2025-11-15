@@ -1,0 +1,15 @@
+
+{
+  "run_id": "exp_001",
+  "model": "Sample Test Experiment",
+  "hyperparameters": {
+    "description": "Example experiment run for testing purposes"
+  },
+  "metrics": {
+    "success_rate": 0.95,
+    "total_tests": 100,
+    "passed": 95,
+    "failed": 5
+  },
+  "timestamp": "2025-11-15T00:00:00Z"
+}

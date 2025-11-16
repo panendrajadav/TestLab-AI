@@ -1,0 +1,13 @@
+{
+  "run_id": "exp_001",
+  "severity": "LOW",
+  "score": 0.1,
+  "flags": ["missing_artifact"],
+  "recommended_actions": ["Fix missing checkpoint"],
+  "raw_metrics": {
+    "success_rate": 0.95,
+    "total_tests": 100,
+    "passed": 95,
+    "failed": 5
+  }
+}

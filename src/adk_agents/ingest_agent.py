@@ -1,7 +1,14 @@
 import json
 import os
 from dotenv import load_dotenv
-from google.genai.types import Content, GenerateContentResponse
+try:
+    import google.generativeai as genai
+    from google.genai.types import Content, GenerateContentResponse, Part
+except ImportError:
+    genai = None
+    Content = dict
+    GenerateContentResponse = dict
+    Part = dict
 
 load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -9,15 +16,25 @@ API_KEY = os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
     raise ValueError("ERROR: GOOGLE_API_KEY missing in .env")
 
+# Configure Gemini
+if genai:
+    genai.configure(api_key=API_KEY)
+    model = genai.GenerativeModel("gemini-pro")
+else:
+    model = None
+
 ML_REQUIRED = ["run_id", "model", "hyperparameters", "metrics", "timestamp"]
 
-def adk_response(text: str) -> GenerateContentResponse:
+def adk_response(text: str):
     """ADK-compliant response wrapper"""
-    return GenerateContentResponse(
-        candidates=[{
-            "content": Content(parts=[{"text": text}])
-        }]
-    )
+    if genai:
+        return GenerateContentResponse(
+            candidates=[{
+                "content": Content(parts=[Part(text=text)])
+            }]
+        )
+    else:
+        return {"candidates": [{"content": {"parts": [{"text": text}]}}]}
 
 def is_ml_format(data: dict):
     return all(f in data for f in ML_REQUIRED)

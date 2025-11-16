@@ -1,24 +1,34 @@
 import json
 import os
 from dotenv import load_dotenv
-from google.genai import Client
-from google.genai.types import Content, GenerateContentResponse
+try:
+    import google.generativeai as genai
+    from google.genai.types import Content, GenerateContentResponse, Part
+except ImportError:
+    genai = None
+    Content = dict
+    GenerateContentResponse = dict
+    Part = dict
 
 load_dotenv()
-API_KEY = os.getenv("GOOGLE_API_KEY")
 
-if not API_KEY:
-    raise ValueError("ERROR: GOOGLE_API_KEY missing in .env")
+# Configure Gemini
+if genai:
+    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+    model = genai.GenerativeModel("gemini-pro")
+else:
+    model = None
 
-client = Client(api_key=API_KEY)
-
-def adk_response(text: str) -> GenerateContentResponse:
+def adk_response(text: str):
     """ADK-compliant response wrapper"""
-    return GenerateContentResponse(
-        candidates=[{
-            "content": Content(parts=[{"text": text}])
-        }]
-    )
+    if genai:
+        return GenerateContentResponse(
+            candidates=[{
+                "content": Content(parts=[Part(text=text)])
+            }]
+        )
+    else:
+        return {"candidates": [{"content": {"parts": [{"text": text}]}}]}
 
 def extract_flag_text(flag):
     """Extract searchable text from flag dict or string"""
@@ -102,11 +112,11 @@ Keep response concise and actionable.
 """
         
         try:
-            llm_response = client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=llm_prompt
-            )
-            llm_plan = llm_response.text if hasattr(llm_response, 'text') else "LLM enhancement unavailable"
+            if model:
+                llm_response = model.generate_content(llm_prompt)
+                llm_plan = llm_response.text if hasattr(llm_response, 'text') else "LLM enhancement unavailable"
+            else:
+                llm_plan = "LLM unavailable (missing google-generativeai)"
         except Exception as e:
             llm_plan = f"LLM enhancement failed: {str(e)}"
         

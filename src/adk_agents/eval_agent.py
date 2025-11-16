@@ -7,11 +7,23 @@ import json
 import math
 import os
 from dotenv import load_dotenv
-from google.genai.types import Content, GenerateContentResponse
+try:
+    import google.generativeai as genai
+    from google.genai.types import Content, GenerateContentResponse, Part
+except ImportError:
+    genai = None
+    Content = dict
+    GenerateContentResponse = dict
+    Part = dict
 
 load_dotenv()
 
-API_KEY = os.getenv("GOOGLE_API_KEY", None)
+# Configure Gemini
+if genai:
+    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+    model = genai.GenerativeModel("gemini-pro")
+else:
+    model = None
 
 # Thresholds
 THRESHOLDS = {
@@ -24,13 +36,16 @@ THRESHOLDS = {
 # ------------- Response Helper -------------
 def respond(text: str):
     """Proper ADK-compliant response wrapper."""
-    return GenerateContentResponse(
-        candidates=[
-            {
-                "content": Content(parts=[{"text": text}])
-            }
-        ]
-    )
+    if genai:
+        return GenerateContentResponse(
+            candidates=[
+                {
+                    "content": Content(parts=[Part(text=text)])
+                }
+            ]
+        )
+    else:
+        return {"candidates": [{"content": {"parts": [{"text": text}]}}]}
 
 # ------------- Metric Helpers -------------
 def is_test_metrics(metrics):

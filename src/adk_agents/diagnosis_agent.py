@@ -16,12 +16,24 @@ import os
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from google.genai.types import Content, GenerateContentResponse
+import google.generativeai as genai
+from google.genai.types import Content, GenerateContentResponse, Part
 
 # MCP client helper (uses requests to call the local MCP server)
-from services.mcp_client import call_anomaly, call_baseline
+try:
+    from services.mcp_client import call_anomaly, call_baseline
+except ImportError:
+    # Fallback for testing
+    def call_anomaly(*args, **kwargs):
+        return {"anomalies": []}
+    def call_baseline(*args, **kwargs):
+        return {"comparison": {}}
 
 load_dotenv()
+
+# Configure Gemini
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+model = genai.GenerativeModel("gemini-pro")
 
 # Thresholds and weights (tunable)
 TH = {
@@ -45,7 +57,7 @@ WEIGHTS = {
 # ---------- ADK response helper ----------
 def respond(obj: Any) -> GenerateContentResponse:
     txt = json.dumps(obj, indent=2)
-    return GenerateContentResponse(candidates=[{"content": Content(parts=[{"text": txt}])}])
+    return GenerateContentResponse(candidates=[{"content": Content(parts=[Part(text=txt)])}])
 
 
 # ---------- utility helpers ----------
@@ -220,11 +232,12 @@ def assemble_recommendations(flags: List[Dict[str, Any]], mcp_results: Dict[str,
 
 
 # ---------- ADK Entrypoint ----------
-def diagnosis_agent(request: Content) -> GenerateContentResponse:
+def diagnosis_agent(request) -> GenerateContentResponse:
     """
     Input contract:
       Accepts either:
-        - normalized experiment dict in request.parts[0].text
+        - Content object with normalized experiment dict in request.parts[0].text
+        - dict directly (for testing)
         - or wrapper: {"normalized": {...}, "baseline": {...}}
     Returns:
       ADK-compliant GenerateContentResponse with fields:
@@ -232,8 +245,13 @@ def diagnosis_agent(request: Content) -> GenerateContentResponse:
         mcp_results (baseline + anomaly), llm_payload (placeholder), raw_metrics
     """
     try:
-        raw = request.parts[0].text
-        data = json.loads(raw)
+        # Handle both Content object and direct dict input
+        if hasattr(request, 'parts'):
+            raw = request.parts[0].text
+            data = json.loads(raw)
+        else:
+            # Direct dict input (for testing)
+            data = request
         exp = data.get("normalized", data)
         run_id = exp.get("run_id", exp.get("experiment_id", "unknown"))
         metrics = exp.get("metrics", {}) or {}

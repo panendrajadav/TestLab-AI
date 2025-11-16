@@ -1,248 +1,334 @@
 """
-Advanced Diagnosis Agent (ADK-compliant)
-- Multi-check anomaly detection
-- Produces severity score (0-100), flags, recommended actions
-- LLM-ready explanation field (placeholder: can be replaced with Gemini call later)
+Ultra-rich Diagnosis Agent (ADK-compliant)
+
+Features:
+- Integrates with local MCP tools (baseline_compare, anomaly_detect) via services.mcp_client
+- Internal checks: overfit, underfit, instability, test fail rates, missing artifacts
+- Merges MCP results into flags and recommendations
+- Computes weighted severity score and label (LOW/MEDIUM/HIGH)
+- Returns ADK-compliant GenerateContentResponse with structured JSON
+- Provides an LLM-ready explanation payload (placeholder) for Planner
 """
 
 import json
 import math
 import os
+from typing import Any, Dict, List, Optional
 
-# Simple response class to replace Google's GenerateContentResponse
-class DiagnosisResponse:
-    def __init__(self, candidates):
-        self.candidates = candidates
+from dotenv import load_dotenv
+from google.genai.types import Content, GenerateContentResponse
 
-# ---------------------------
-# Configuration / thresholds
-# ---------------------------
+# MCP client helper (uses requests to call the local MCP server)
+from services.mcp_client import call_anomaly, call_baseline
+
+load_dotenv()
+
+# Thresholds and weights (tunable)
 TH = {
-    # ML thresholds
-    "val_over_train_pct_warn": 0.10,   # val_loss > train_loss by 10% -> warning
-    "val_over_train_pct_fail": 0.30,   # >30% -> fail / severe
-    "train_val_ratio_unstable": 0.20,  # large relative diff triggers instability
-    "variance_rel_threshold": 0.08,    # rel stddev level considered high
-    # test metric thresholds
-    "success_rate_good": 0.90,
-    "success_rate_warning": 0.75,
-    # severity weights
-    "weights": {
-        "missing_artifact": 25,
-        "high_fail_rate": 30,
-        "overfit_warning": 15,
-        "overfit_fail": 35,
-        "high_variance": 20,
-        "low_success_rate": 30,
-        "metric_spike": 20,
-        "drift_hint": 25
-    }
+    "overfit_pct": 0.10,
+    "loss_high_abs": 1.0,
+    "unstable_relstd": 0.10,
+    "fail_rate_warning": 0.10,
+    "fail_rate_high": 0.25,
+    "regression_pct": 0.05
 }
 
-# ---------------------------
-# Response helper (ADK)
-# ---------------------------
-def respond(obj):
-    text = json.dumps(obj, indent=2)
-    return DiagnosisResponse(
-        candidates=[
-            type('Candidate', (), {
-                'content': type('Content', (), {
-                    'parts': [type('Part', (), {'text': text})()]
-                })()
-            })()
-        ]
-    )
+WEIGHTS = {
+    "critical": 0.5,
+    "high": 0.35,
+    "medium": 0.15,
+    "mcp_anomaly": 0.3,
+    "mcp_regression": 0.4
+}
 
-# ---------------------------
-# small helpers
-# ---------------------------
-def safe_get(metrics, keys):
-    for k in keys:
-        if k in metrics:
-            return metrics[k]
+
+# ---------- ADK response helper ----------
+def respond(obj: Any) -> GenerateContentResponse:
+    txt = json.dumps(obj, indent=2)
+    return GenerateContentResponse(candidates=[{"content": Content(parts=[{"text": txt}])}])
+
+
+# ---------- utility helpers ----------
+def safe_get(metrics: Dict[str, Any], names: List[str]):
+    for n in names:
+        if n in metrics:
+            return metrics[n]
     return None
 
-def rel_std(values):
-    if not values:
-        return 0.0
-    mean = sum(values) / len(values)
-    if mean == 0:
-        return float("inf") if any(v != 0 for v in values) else 0.0
+
+def compute_rel_std(values: List[float]) -> Optional[float]:
+    if not values or len(values) < 2:
+        return None
     n = len(values)
-    if n <= 1:
-        return 0.0
-    var = sum((v - mean) ** 2 for v in values) / (n - 1)
-    return math.sqrt(var) / abs(mean)
+    mean_val = sum(values) / n
+    if mean_val == 0:
+        return None
+    var = sum((x - mean_val) ** 2 for x in values) / (n - 1)
+    std = math.sqrt(var)
+    return std / mean_val
 
-# ---------------------------
-# core diagnosis checks
-# ---------------------------
-def check_missing_artifacts(exp):
-    artifacts = exp.get("artifacts", {})
-    if not artifacts or not any(artifacts.values()):
-        return True, "No artifacts (checkpoint) found."
-    return False, None
 
-def check_test_failures(metrics):
-    # For test-based metrics compute fail rate
-    if "failed" in metrics and "total_tests" in metrics:
-        failed = metrics.get("failed", 0)
-        total = metrics.get("total_tests", 0)
-        if total > 0:
-            fail_rate = failed / total
-            if fail_rate > 0.2:  # arbitrary threshold -> severe
-                return True, f"High fail rate: {failed}/{total} ({fail_rate:.1%})."
-            if fail_rate > 0.05:
-                return True, f"Moderate fail rate: {failed}/{total} ({fail_rate:.1%})."
-    # fallback: check success_rate
-    if "success_rate" in metrics:
-        sr = metrics.get("success_rate")
-        if sr is not None:
-            if sr < TH["success_rate_warning"]:
-                return True, f"Low success rate: {sr:.2f}."
-    return False, None
+def ensure_list(v):
+    if isinstance(v, list):
+        return v
+    return None
 
-def check_overfit_underfit(metrics):
-    train_loss = safe_get(metrics, ["train_loss"])
-    val_loss = safe_get(metrics, ["val_loss", "validation_loss"])
-    flags = []
-    if train_loss is not None and val_loss is not None:
-        # val > train => possible overfit
+
+def add_flag(flags: List[Dict[str, Any]], code: str, level: str, message: str, meta: Optional[Dict] = None):
+    flags.append({
+        "code": code,
+        "level": level,  # CRITICAL / HIGH / MEDIUM / INFO
+        "message": message,
+        "meta": meta or {}
+    })
+
+
+# ---------- internal checks ----------
+def check_overfit(metrics: Dict[str, Any]) -> Optional[Dict]:
+    train_loss = safe_get(metrics, ["train_loss", "train_loss_value"])
+    val_loss = safe_get(metrics, ["val_loss", "validation_loss", "val_loss_value"])
+    if train_loss is None or val_loss is None:
+        return None
+    try:
         if train_loss > 0:
             pct = (val_loss - train_loss) / max(train_loss, 1e-9)
-            if pct > TH["val_over_train_pct_fail"]:
-                flags.append(("overfit_fail", f"Validation loss is {pct:.1%} higher than training loss (severe overfit)."))
-            elif pct > TH["val_over_train_pct_warn"]:
-                flags.append(("overfit_warn", f"Validation loss is {pct:.1%} higher than training loss (possible overfit)."))
-        # underfit: both losses high / similar, or accuracy low -- handled in eval agent
-    return flags
+            if pct > TH["overfit_pct"]:
+                return {"code": "overfit", "pct": pct, "train_loss": train_loss, "val_loss": val_loss}
+    except Exception:
+        pass
+    return None
 
-def check_metric_spikes(metrics):
-    # detect large sudden changes in history arrays
-    spikes = []
+
+def check_underfit(metrics: Dict[str, Any]) -> Optional[Dict]:
+    train_loss = safe_get(metrics, ["train_loss", "train_loss_value"])
+    val_loss = safe_get(metrics, ["val_loss", "validation_loss"])
+    acc = safe_get(metrics, ["accuracy", "acc", "val_accuracy"])
+    if train_loss is None or val_loss is None:
+        return None
+    if train_loss > TH["loss_high_abs"] and val_loss > TH["loss_high_abs"]:
+        if acc is None or acc < 0.6:
+            return {"code": "underfit", "train_loss": train_loss, "val_loss": val_loss, "accuracy": acc}
+    return None
+
+
+def check_instability(metrics: Dict[str, Any]) -> List[Dict]:
+    issues = []
     for k, v in metrics.items():
-        if isinstance(v, list) and len(v) >= 3:
-            # look for sudden change from previous to last > 50%
-            prev = v[-2]
-            last = v[-1]
-            if prev != 0 and abs((last - prev) / max(abs(prev), 1e-9)) > 0.5:
-                spikes.append((k, f"Large spike in '{k}' from {prev} -> {last}"))
-    return spikes
+        arr = ensure_list(v)
+        if arr:
+            relstd = compute_rel_std(arr)
+            if relstd is not None and relstd > TH["unstable_relstd"]:
+                issues.append({"code": "unstable_metric", "metric": k, "rel_std": relstd})
+    return issues
 
-def check_variance(metrics):
-    flags = []
-    for k, v in metrics.items():
-        if isinstance(v, list) and len(v) >= 3:
-            rs = rel_std(v)
-            if rs > TH["variance_rel_threshold"]:
-                flags.append((k, f"High relative variability in '{k}' (rel_std={rs:.2f})"))
-    return flags
 
-def check_drift_hint(exp):
-    # Placeholder: if memory/baseline data exists, compare; here we check timestamps to hint drift
-    # If a timestamp is old or inconsistent, we just return None — real drift check uses MemoryBank.
-    return None  # no-op now; future extension
+def check_test_failures(metrics: Dict[str, Any]) -> Optional[Dict]:
+    if "failed" in metrics and "total_tests" in metrics:
+        try:
+            failed = metrics.get("failed", 0)
+            total = metrics.get("total_tests", 0)
+            if total > 0:
+                fail_rate = failed / total
+                if fail_rate >= TH["fail_rate_high"]:
+                    return {"code": "high_fail_rate", "fail_rate": fail_rate}
+                if fail_rate >= TH["fail_rate_warning"]:
+                    return {"code": "moderate_fail_rate", "fail_rate": fail_rate}
+        except Exception:
+            pass
+    return None
 
-# ---------------------------
-# severity calculator
-# ---------------------------
-def compute_severity(flags):
-    score = 0
-    # flags is list of tuples (code or key, message)
-    for code, _ in flags:
-        w = TH["weights"].get(code, 10)
-        score += w
-    return min(100, score)
 
-# ---------------------------
-# Agent entrypoint
-# ---------------------------
-def diagnosis_agent(request):
-    try:
-        # Handle both dict and Content object inputs
-        if isinstance(request, dict):
-            data = request
-        elif hasattr(request, 'parts'):
-            raw = request.parts[0].text
-            data = json.loads(raw)
+def artifact_check(exp: Dict[str, Any]) -> Optional[Dict]:
+    # Check for presence of typical artifact fields (checkpoint / artifacts)
+    artifacts = exp.get("artifacts") or exp.get("checkpoint") or exp.get("checkpoints")
+    if not artifacts:
+        return {"code": "missing_artifact", "message": "No artifacts (checkpoint) found."}
+    return None
+
+
+# ---------- combine results and score ----------
+def compute_weighted_score(flags: List[Dict[str, Any]], mcp_results: Dict[str, Any]) -> float:
+    score = 0.0
+    # map levels
+    for f in flags:
+        lvl = f.get("level", "INFO").upper()
+        if lvl == "CRITICAL":
+            score += WEIGHTS["critical"]
+        elif lvl == "HIGH":
+            score += WEIGHTS["high"]
+        elif lvl == "MEDIUM":
+            score += WEIGHTS["medium"]
         else:
-            # Assume it's a JSON string
-            data = json.loads(str(request))
+            score += 0.0
 
-        # input normalized experiment dict expected
+    # MCP anomalies
+    if mcp_results and isinstance(mcp_results, dict):
+        anomaly_score = mcp_results.get("summary_score", 0.0)
+        score += anomaly_score * WEIGHTS["mcp_anomaly"]
+        # regression presence increases score
+        comp = mcp_results.get("comparison") or {}
+        for k, v in comp.items():
+            z = v.get("z")
+            if z is not None and abs(z) > 2.5:
+                score += WEIGHTS["mcp_regression"]
+
+    # clamp 0..1
+    return max(0.0, min(1.0, score))
+
+
+def severity_label_from_score(score: float) -> str:
+    if score >= 0.6:
+        return "HIGH"
+    if score >= 0.25:
+        return "MEDIUM"
+    return "LOW"
+
+
+def assemble_recommendations(flags: List[Dict[str, Any]], mcp_results: Dict[str, Any]) -> List[str]:
+    recs = []
+    # generate based on flags
+    for f in flags:
+        code = f.get("code", "")
+        if "overfit" in code:
+            recs.append("Reduce overfitting: add regularization (dropout), use early stopping, or augment data.")
+        elif "underfit" in code:
+            recs.append("Address underfitting: increase model capacity, train longer, or tune optimizer/hyperparams.")
+        elif "unstable_metric" in code:
+            recs.append("Stabilize training: reduce LR, increase batch size, or add gradient clipping and check pipeline.")
+        elif "fail_rate" in code:
+            recs.append("Inspect failing tests; cluster failures and create focused test cases; prioritize fixes.")
+        elif "missing_artifact" in code:
+            recs.append("Ensure model checkpoints/artifacts are saved to configured storage and accessible.")
+        elif "regression" in code:
+            recs.append("Compare checkpoints and hyperparameters vs baseline; consider rollback or A/B tests.")
+
+    # incorporate MCP suggestions
+    if mcp_results:
+        comp = mcp_results.get("comparison", {})
+        for metric, info in comp.items():
+            z = info.get("z")
+            if z is not None and abs(z) > 2.5:
+                recs.append(f"Metric '{metric}' deviates from baseline (z={z:.2f}). Investigate data/labels.")
+    if not recs:
+        recs.append("No immediate actions detected; monitor and collect more runs for stable baselines.")
+    # deduplicate
+    dedup = []
+    for r in recs:
+        if r not in dedup:
+            dedup.append(r)
+    return dedup
+
+
+# ---------- ADK Entrypoint ----------
+def diagnosis_agent(request: Content) -> GenerateContentResponse:
+    """
+    Input contract:
+      Accepts either:
+        - normalized experiment dict in request.parts[0].text
+        - or wrapper: {"normalized": {...}, "baseline": {...}}
+    Returns:
+      ADK-compliant GenerateContentResponse with fields:
+        run_id, severity_score (0..100), severity_label, flags (grouped), recommended_actions,
+        mcp_results (baseline + anomaly), llm_payload (placeholder), raw_metrics
+    """
+    try:
+        raw = request.parts[0].text
+        data = json.loads(raw)
         exp = data.get("normalized", data)
-        metrics = exp.get("metrics", {})
+        run_id = exp.get("run_id", exp.get("experiment_id", "unknown"))
+        metrics = exp.get("metrics", {}) or {}
 
-        # accumulate flags (code, message)
-        flags = []
+        flags: List[Dict[str, Any]] = []
 
-        # missing artifacts
-        ma, ma_msg = check_missing_artifacts(exp)
-        if ma:
-            flags.append(("missing_artifact", ma_msg))
+        # Internal deterministic checks
+        of = check_overfit(metrics)
+        if of:
+            add_flag(flags, "overfit", "HIGH", f"Validation loss higher than training loss by {of['pct']:.1%}", of)
 
-        # test failure checks
-        tf, tf_msg = check_test_failures(metrics)
+        uf = check_underfit(metrics)
+        if uf:
+            add_flag(flags, "underfit", "HIGH", "High train & val loss with low accuracy", uf)
+
+        instability = check_instability(metrics)
+        for inst in instability:
+            add_flag(flags, "unstable_metric", "MEDIUM", f"Metric {inst['metric']} shows high relative std {inst['rel_std']:.2f}", inst)
+
+        tf = check_test_failures(metrics)
         if tf:
-            # choose severity code
-            if "High fail rate" in (tf_msg or "") or "Low success rate" in (tf_msg or ""):
-                flags.append(("high_fail_rate", tf_msg))
-            else:
-                flags.append(("high_fail_rate", tf_msg))
+            level = "HIGH" if tf["code"] == "high_fail_rate" else "MEDIUM"
+            add_flag(flags, tf["code"], level, f"Fail rate: {tf.get('fail_rate')}", tf)
 
-        # overfit/underfit
-        oflags = check_overfit_underfit(metrics)
-        for code, msg in oflags:
-            if code == "overfit_fail":
-                flags.append(("overfit_fail", msg))
-            else:
-                flags.append(("overfit_warning", msg))
+        art = artifact_check(exp)
+        if art:
+            add_flag(flags, art.get("code", "missing_artifact"), "MEDIUM", art.get("message", ""), art)
 
-        # spikes
-        spikes = check_metric_spikes(metrics)
-        for k, msg in spikes:
-            flags.append(("metric_spike", msg))
+        # Call MCP tools (best-effort)
+        mcp_baseline = None
+        mcp_anomaly = None
+        try:
+            mcp_baseline = call_baseline(metrics, run_id=run_id, top_k=5)
+        except Exception as e:
+            add_flag(flags, "mcp_baseline_error", "INFO", f"Baseline tool error: {str(e)}", {"error": str(e)})
 
-        # variance checks
-        var_flags = check_variance(metrics)
-        for k, msg in var_flags:
-            flags.append(("high_variance", msg))
+        try:
+            mcp_anomaly = call_anomaly(metrics, run_id=run_id, sensitivity=2.0)
+        except Exception as e:
+            add_flag(flags, "mcp_anomaly_error", "INFO", f"Anomaly tool error: {str(e)}", {"error": str(e)})
 
-        # drift hint placeholder
-        drift = check_drift_hint(exp)
-        if drift:
-            flags.append(("drift_hint", drift))
+        # incorporate MCP anomaly findings
+        if mcp_anomaly and isinstance(mcp_anomaly, dict):
+            anomalies = mcp_anomaly.get("anomalies", [])
+            for a in anomalies:
+                sev = "HIGH" if a.get("severity") == "HIGH" else ("MEDIUM" if a.get("severity") == "MEDIUM" else "INFO")
+                add_flag(flags, f"mcp_{a.get('type', 'anomaly')}", sev, f"Anomaly detected: {a.get('metric')} ({a.get('type')})", a)
 
-        # compute severity
-        severity = compute_severity(flags)
+        # incorporate MCP baseline regressions (z-score based)
+        if mcp_baseline and isinstance(mcp_baseline, dict):
+            comp = mcp_baseline.get("comparison", {})
+            for metric, info in comp.items():
+                z = info.get("z")
+                if z is not None:
+                    if abs(z) > 3.0:
+                        add_flag(flags, f"regression_{metric}", "HIGH", f"Large deviation vs baseline (z={z:.2f})", {"metric": metric, "z": z})
+                    elif abs(z) > 2.5:
+                        add_flag(flags, f"regression_{metric}", "MEDIUM", f"Moderate deviation vs baseline (z={z:.2f})", {"metric": metric, "z": z})
 
-        # recommended actions (simple mapping)
-        recommended = []
-        for code, _ in flags:
-            if code == "missing_artifact":
-                recommended.append("Ensure model checkpoints/artifacts are being saved to the configured storage.")
-            if code == "high_fail_rate":
-                recommended.append("Investigate failing tests and logs; rerun failed cases locally.")
-            if code in ("overfit_warning", "overfit_fail"):
-                recommended.append("Consider regularization (dropout), reduce model complexity, or get more data.")
-            if code == "metric_spike":
-                recommended.append("Inspect recent training logs for instability or preemption incidents.")
-            if code == "high_variance":
-                recommended.append("Run additional runs to confirm variability, consider averaging or smoothing metrics.")
-            if code == "drift_hint":
-                recommended.append("Compare with historical runs in Memory Bank for drift analysis.")
+        # compute weighted severity score 0..1 then scale to 0..100
+        weighted = compute_weighted_score(flags, mcp_baseline or {})
+        severity_label = severity_label_from_score(weighted)
+        severity_score_pct = round(weighted * 100, 2)
 
-        # prepare LLM-ready explanation (placeholder text)
-        llm_explanation = "Diagnosis summary ready. For full natural language reasoning, call Gemini with the summary+context."
+        # assemble recommendations
+        recommendations = assemble_recommendations(flags, mcp_baseline or {})
+
+        # prepare LLM-ready explanation payload (compact)
+        llm_payload = {
+            "run_id": run_id,
+            "summary": {
+                "severity_score_pct": severity_score_pct,
+                "severity_label": severity_label,
+                "top_flags": flags[:5]
+            },
+            "context": {
+                "metrics": metrics,
+                "mcp_baseline": mcp_baseline,
+                "mcp_anomaly": mcp_anomaly
+            },
+            "instructions": "Produce a concise diagnostic summary and prioritized remediation plan (max 300 words)."
+        }
 
         # final structured output
         out = {
-            "run_id": exp.get("run_id"),
-            "severity_score": severity,
-            "flags": [{"code": c, "message": m} for c, m in flags],
-            "recommended_actions": recommended,
-            "llm_explanation": llm_explanation,
+            "run_id": run_id,
+            "severity_label": severity_label,
+            "severity_score_pct": severity_score_pct,
+            "flags": flags,
+            "recommended_actions": recommendations,
+            "mcp_results": {
+                "baseline": mcp_baseline,
+                "anomaly": mcp_anomaly
+            },
+            "llm_payload": llm_payload,
             "raw_metrics": metrics
         }
 

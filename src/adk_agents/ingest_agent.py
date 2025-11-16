@@ -1,7 +1,6 @@
 import json
 import os
 from dotenv import load_dotenv
-from google.genai import Client
 from google.genai.types import Content, GenerateContentResponse
 
 load_dotenv()
@@ -10,9 +9,15 @@ API_KEY = os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
     raise ValueError("ERROR: GOOGLE_API_KEY missing in .env")
 
-client = Client(api_key=API_KEY)
-
 ML_REQUIRED = ["run_id", "model", "hyperparameters", "metrics", "timestamp"]
+
+def adk_response(text: str) -> GenerateContentResponse:
+    """ADK-compliant response wrapper"""
+    return GenerateContentResponse(
+        candidates=[{
+            "content": Content(parts=[{"text": text}])
+        }]
+    )
 
 def is_ml_format(data: dict):
     return all(f in data for f in ML_REQUIRED)
@@ -35,33 +40,49 @@ def normalize_custom_format(data: dict):
         "timestamp": data.get("created_at", "1970-01-01T00:00:00Z")
     }
 
-def ingest_agent(request: Content) -> GenerateContentResponse:
+def ingest_agent(request) -> GenerateContentResponse:
     try:
-        exp_text = request.parts[0].text
-        data = json.loads(exp_text)
+        # Handle both dict and Content object inputs
+        if isinstance(request, dict):
+            data = request
+        elif hasattr(request, 'parts'):
+            exp_text = request.parts[0].text
+            data = json.loads(exp_text)
+        else:
+            data = json.loads(str(request))
 
         # CASE 1: ML format
         if is_ml_format(data):
-            print("Detected ML format")
-            return GenerateContentResponse(
-                output="[SUCCESS] ML experiment validated and ingested."
-            )
+            result = {
+                "status": "success",
+                "format": "ml",
+                "normalized": data,
+                "message": "ML experiment validated and ingested."
+            }
+            return adk_response(json.dumps(result, indent=2))
 
         # CASE 2: Custom format
         if is_custom_format(data):
-            print("Detected CUSTOM format")
             normalized = normalize_custom_format(data)
-            return GenerateContentResponse(
-                output="[SUCCESS] Custom format normalized:\n"
-                       + json.dumps(normalized, indent=2)
-            )
+            result = {
+                "status": "success",
+                "format": "custom",
+                "normalized": normalized,
+                "message": "Custom format normalized and ingested."
+            }
+            return adk_response(json.dumps(result, indent=2))
 
         # CASE 3: Unknown
-        return GenerateContentResponse(
-            output="[ERROR] Unsupported experiment format."
-        )
+        error_result = {
+            "status": "error",
+            "message": "Unsupported experiment format.",
+            "received_keys": list(data.keys()) if isinstance(data, dict) else "non-dict"
+        }
+        return adk_response(json.dumps(error_result, indent=2))
 
     except Exception as e:
-        return GenerateContentResponse(
-            output=f"[ERROR] Ingestion failed: {str(e)}"
-        )
+        error_result = {
+            "status": "error",
+            "message": f"Ingestion failed: {str(e)}"
+        }
+        return adk_response(json.dumps(error_result, indent=2))

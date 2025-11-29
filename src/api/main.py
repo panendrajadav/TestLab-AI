@@ -3,14 +3,19 @@ FastAPI Application for TestLab-AI
 
 Provides REST API endpoint for running the full pipeline:
 INGEST → DIAGNOSIS → ML_IMPROVEMENT → EVALUATION → PLANNER
+
+Also serves static frontend build (monorepo setup).
 """
 
 import json
 import sys
 import os
+import time
 from typing import Dict, Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 # Add src to path for imports
@@ -63,8 +68,8 @@ async def root():
         "service": "TestLab-AI Pipeline",
         "status": "running",
         "endpoints": {
-            "pipeline": "/run_pipeline",
-            "health": "/health"
+            "pipeline": "/api/run_pipeline",
+            "health": "/api/health"
         }
     }
 
@@ -83,7 +88,13 @@ async def health_check():
         ]
     }
 
-@app.post("/run_pipeline", response_model=Dict[str, Any])
+
+@app.get("/api/health")
+async def api_health_check():
+    """Alias for frontend requests that use /api/ prefix"""
+    return await health_check()
+
+@app.post("/api/run_pipeline", response_model=Dict[str, Any])
 async def run_pipeline(experiment: ExperimentRequest):
     """
     Run the full advanced pipeline on experiment data
@@ -132,7 +143,7 @@ async def run_pipeline(experiment: ExperimentRequest):
             detail=f"Pipeline execution failed: {str(e)}"
         )
 
-@app.post("/run_pipeline_simple")
+@app.post("/api/run_pipeline_simple")
 async def run_pipeline_simple(data: Dict[str, Any]):
     """
     Simplified endpoint that accepts raw JSON data
@@ -163,6 +174,78 @@ async def run_pipeline_simple(data: Dict[str, Any]):
             status_code=500,
             detail=f"Pipeline execution failed: {str(e)}"
         )
+
+@app.post("/api/run_pipeline_realtime")
+async def run_pipeline_realtime(data: Dict[str, Any]):
+    """
+    Run pipeline with Server-Sent Events (SSE) for real-time updates
+    """
+    async def event_generator():
+        try:
+            # Create Content request for coordinator
+            try:
+                content_request = Content(parts=[Part(text=json.dumps(data))])
+            except:
+                content_request = {"parts": [{"text": json.dumps(data)}]}
+            
+            # Send start event
+            yield f"data: {json.dumps({'step': 'server', 'status': 'processing', 'message': 'Starting pipeline...', 'run_id': data.get('run_id', 'unknown')})}\n\n"
+            
+            # Call coordinator agent
+            response = coordinator_agent(content_request)
+            
+            # Extract response data
+            if hasattr(response, 'candidates') and response.candidates:
+                result_text = response.candidates[0].content.parts[0].text
+                result_data = json.loads(result_text)
+                
+                # Send each stage as it completes
+                stages = ['ingest', 'diagnosis', 'ml_improvement', 'evaluation', 'planner']
+                for stage in stages:
+                    stage_data = result_data.get(stage, {})
+                    status = 'completed' if stage_data and 'error' not in stage_data else 'error'
+                    message = stage_data.get('error', f'{stage} completed') if status == 'error' else f'{stage} completed'
+                    
+                    yield f"data: {json.dumps({'step': stage, 'status': status, 'message': message, 'run_id': result_data.get('run_id'), 'result': stage_data})}\n\n"
+                
+                # Send final result
+                yield f"data: {json.dumps({'step': 'complete', 'status': 'completed', 'message': 'Pipeline complete', 'final_result': result_data})}\n\n"
+            else:
+                yield f"data: {json.dumps({'step': 'error', 'status': 'error', 'message': 'Invalid response from coordinator agent'})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'step': 'error', 'status': 'error', 'message': f'Pipeline execution failed: {str(e)}'})}\n\n"
+    
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# ============ MONOREPO SETUP: SERVE STATIC FRONTEND ============
+# Serve static files from frontend build output
+dist_path = os.path.join(os.path.dirname(__file__), '../../dist/client')
+if os.path.isdir(dist_path):
+    app.mount("/static", StaticFiles(directory=dist_path), name="static")
+
+@app.get("/{full_path:path}")
+async def serve_spa(full_path: str):
+    """
+    Serve React SPA from dist/client
+    Falls back to index.html for client-side routing
+    """
+    # Skip API routes
+    if full_path.startswith("api/"):
+        return {"error": "API route not found", "path": full_path}
+    
+    file_path = os.path.join(dist_path, full_path)
+    
+    # If file exists, serve it
+    if os.path.isfile(file_path):
+        return FileResponse(file_path)
+    
+    # Otherwise, serve index.html for client-side routing
+    index_path = os.path.join(dist_path, "index.html")
+    if os.path.isfile(index_path):
+        return FileResponse(index_path)
+    
+    # Fallback if dist not built yet
+    return {"message": "Frontend not built. Run 'npm run build' in frontend/ folder."}
 
 if __name__ == "__main__":
     import uvicorn

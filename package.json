@@ -1,0 +1,35 @@
+{
+  "name": "testlab-ai",
+  "version": "1.0.0",
+  "description": "TestLab-AI - Unified monorepo with React frontend and Python backend",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install && cd frontend && npm install",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:backend": "cd backend && python start_api_server.py",
+    "dev:mcp": "cd backend && python start_server.py",
+    "dev": "echo 'Start services in separate terminals:' && echo '  Terminal 1: npm run dev:mcp' && echo '  Terminal 2: npm run dev:backend' && echo '  Terminal 3: npm run dev:frontend'",
+    "build:frontend": "cd frontend && npm run build",
+    "build:backend": "echo 'Python backend requires no build step'",
+    "build": "npm run build:frontend",
+    "lint:frontend": "cd frontend && npm run lint",
+    "type-check": "cd frontend && npm run type-check",
+    "preview": "cd frontend && npm run preview",
+    "test": "cd backend && python -m pytest -q",
+    "clean": "rimraf dist/ frontend/dist node_modules/ frontend/node_modules/"
+  },
+  "keywords": [
+    "ml",
+    "pipeline",
+    "diagnosis",
+    "analysis"
+  ],
+  "author": "",
+  "license": "MIT",
+  "workspaces": [
+    "frontend"
+  ],
+  "devDependencies": {
+    "rimraf": "^6.0.1"
+  }
+}

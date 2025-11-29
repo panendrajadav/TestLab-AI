@@ -12,8 +12,8 @@ import sys
 import os
 from pathlib import Path
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+# Add current directory to path (backend agents are here, not in src/)
+sys.path.insert(0, os.path.dirname(__file__))
 
 # Try to enable CORS for frontend development
 try:
